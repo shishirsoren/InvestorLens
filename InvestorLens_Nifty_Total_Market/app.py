@@ -11,6 +11,8 @@ import requests
 import streamlit as st
 import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from ratio_engine import calculate_peg, calculate_piotroski, calculate_altman_z, render_ratio_audit_panel
+from market_industry import render_market_industry_panel
 
 st.set_page_config(
     page_title="InvestorLens — Indian Equity Intelligence",
@@ -207,6 +209,7 @@ def get_live_quote(sym: str) -> Dict[str, Any]:
                     "high": float(q.get("h")) if q.get("h") is not None else np.nan,
                     "low": float(q.get("l")) if q.get("l") is not None else np.nan,
                     "open": float(q.get("o")) if q.get("o") is not None else np.nan,
+                    "volume": np.nan,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "source": "Configured live quote API",
                 }
@@ -222,6 +225,11 @@ def get_live_quote(sym: str) -> Dict[str, Any]:
             raise ValueError("No latest price")
         last = float(last)
         prev = float(prev) if prev is not None else np.nan
+        try:
+            volume = fi.get("last_volume", fi.get("lastVolume"))
+            volume = float(volume) if volume is not None else np.nan
+        except Exception:
+            volume = np.nan
         ch = last - prev if np.isfinite(prev) else np.nan
         chp = ch / prev * 100 if np.isfinite(ch) and prev != 0 else np.nan
         return {
@@ -232,11 +240,12 @@ def get_live_quote(sym: str) -> Dict[str, Any]:
             "high": np.nan,
             "low": np.nan,
             "open": np.nan,
+            "volume": volume,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source": "Yahoo Finance latest available quote",
         }
     except Exception:
-        return {"price": np.nan, "prev_close": np.nan, "change": np.nan, "change_pct": np.nan, "source": "Unavailable"}
+        return {"price": np.nan, "prev_close": np.nan, "change": np.nan, "change_pct": np.nan, "volume": np.nan, "source": "Unavailable"}
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -766,49 +775,14 @@ def technical_summary(sym: str) -> Tuple[Dict[str, float], pd.DataFrame]:
 
 # ----------------------------- Alternative analysis ---------------------
 def piotroski(fin: Dict[str, pd.DataFrame]) -> Tuple[float, List[str]]:
-    inc, bal, cf = fin.get("income", pd.DataFrame()), fin.get("balance", pd.DataFrame()), fin.get("cashflow", pd.DataFrame())
-    y = 0
-    notes = []
-    net0, net1 = last_two_values(inc, FIN_ALIASES["Net Income"])
-    cfo0, cfo1 = last_two_values(cf, FIN_ALIASES["CFO"])
-    assets0, assets1 = last_two_values(bal, FIN_ALIASES["Assets"])
-    debt0, debt1 = last_two_values(bal, FIN_ALIASES["Debt"])
-    ca0, ca1 = last_two_values(bal, FIN_ALIASES["Current Assets"])
-    cl0, cl1 = last_two_values(bal, FIN_ALIASES["Current Liabilities"])
-    revenue0, revenue1 = last_two_values(inc, FIN_ALIASES["Revenue"])
-
-    if np.isfinite(net0):
-        y += int(net0 > 0); notes.append("Positive earnings" if net0 > 0 else "Negative earnings")
-    if np.isfinite(cfo0):
-        y += int(cfo0 > 0); notes.append("Positive operating cash flow" if cfo0 > 0 else "Negative operating cash flow")
-    if np.all(np.isfinite([assets0, net0, assets1, net1, cfo0, cfo1])):
-        roa0, roa1 = net0 / assets0, net1 / assets1
-        y += int(roa0 > roa1); notes.append("ROA improving" if roa0 > roa1 else "ROA not improving")
-        y += int(cfo0 > net0); notes.append("CFO exceeds net income" if cfo0 > net0 else "CFO does not exceed net income")
-    if np.all(np.isfinite([debt0, debt1, assets0, assets1])):
-        y += int(debt0 / assets0 < debt1 / assets1); notes.append("Leverage improved" if debt0 / assets0 < debt1 / assets1 else "Leverage not improved")
-    if np.all(np.isfinite([ca0, cl0, ca1, cl1])):
-        y += int(ca0 / cl0 > ca1 / cl1); notes.append("Liquidity improved" if ca0 / cl0 > ca1 / cl1 else "Liquidity not improved")
-    if np.all(np.isfinite([revenue0, revenue1, net0, net1])):
-        margin0, margin1 = safe_div(net0, revenue0), safe_div(net1, revenue1)
-        y += int(margin0 > margin1); notes.append("Margin improved" if margin0 > margin1 else "Margin not improved")
-    # Use asset turnover as the ninth check; share-count data is inconsistent across providers.
-    if np.all(np.isfinite([revenue0, revenue1, assets0, assets1])):
-        turnover0, turnover1 = revenue0 / assets0, revenue1 / assets1
-        y += int(turnover0 > turnover1); notes.append("Asset turnover improved" if turnover0 > turnover1 else "Asset turnover not improved")
-    return float(min(y, 9)), notes
+    # Score only when all nine binary tests have matching current/prior FY data.
+    return calculate_piotroski(fin)
 
 
 def altman_z(r: Dict[str, float]) -> float:
-    A = r.get("_assets", np.nan)
-    B = r.get("_retained", np.nan)
-    C = r.get("_ebit", np.nan)
-    D = r.get("_mcap", np.nan)
-    E = r.get("_liab", np.nan)
-    revenue = r.get("_rev", np.nan)
-    if not np.all(np.isfinite([A, B, C, D, E, revenue])) or A == 0 or E == 0:
-        return np.nan
-    return float(1.4 * (B / A) + 3.3 * (C / A) + 0.6 * (D / E) + 1.0 * (revenue / A))
+    # The legacy implementation omitted working capital and mixed present-day market cap
+    # with historical statements. It is deliberately retired; callers use calculate_altman_z(fin, info).
+    return np.nan
 
 
 def beneish_mscore(r: Dict[str, float], fin: Dict[str, pd.DataFrame]) -> float:
@@ -1099,6 +1073,8 @@ with st.spinner("Fetching 5-year data, market quote, financials and news…"):
     forecasts = get_forecasts(sym)
     live = get_live_quote(sym)
     ratios = calc_ratios(sym, fin, info, live.get("price", np.nan))
+    peg_value, peg_reason = calculate_peg(fin, info)
+    ratios["PEG"] = peg_value if peg_value is not None else np.nan
     hist = build_5y_financial_history(fin)
     hist_r = history_ratios(hist)
     tech, tech_df = technical_summary(sym)
@@ -1110,7 +1086,7 @@ for row in sent_rows:
 sentiment = float(np.mean([r["sentiment"] for r in sent_rows])) if sent_rows else 0.0
 
 pio, pio_notes = piotroski(fin)
-altz = altman_z(ratios)
+altz = calculate_altman_z(fin, info, str(info.get("industry") or info.get("sector") or ""))[0]
 beneish = beneish_mscore(ratios, fin)
 dup = dupont(ratios)
 capm = capm_analysis(sym, rf, market_return)
@@ -1169,6 +1145,8 @@ tabs = st.tabs([
     "🧭 SWOT",
     "🧰 Screener",
     "🔍 Data Audit",
+    "🧮 Supplemental Ratios Audit",
+    "🌐 Live Market & Industry",
 ])
 
 with tabs[0]:
@@ -1375,10 +1353,10 @@ with tabs[12]:
     st.subheader("Alternative / forensic analysis")
     ac = st.columns(4)
     ac[0].metric("Piotroski F", f"{pio:.0f}/9" if np.isfinite(pio) else "N/A")
-    ac[1].metric("Altman Z proxy", fmt(altz, 2))
+    ac[1].metric("Altman Z-Score", fmt(altz, 2))
     ac[2].metric("Beneish M", fmt(beneish, 2))
     ac[3].metric("DuPont ROE", f"{dup*100:.2f}%" if np.isfinite(dup) else "N/A")
-    st.write("These models are screening tools with material industry and accounting-data limitations. A flag is not proof of distress, manipulation or misconduct.")
+    st.write("Piotroski is only scored when all nine tests have matching current/prior financial inputs. Altman Z-Score is only calculated when the model variant and matching FY-end market-equity input are available; otherwise it is N/A. These are screening tools, not proof of distress or misconduct.")
     if pio_notes:
         st.dataframe(pd.DataFrame({"Piotroski check": pio_notes}), use_container_width=True, hide_index=True)
 
@@ -1475,3 +1453,20 @@ with tabs[15]:
     coverage["Status"] = np.where(coverage["Periods available"] >= 5, "PASS", "INCOMPLETE")
     st.dataframe(coverage, use_container_width=True, hide_index=True)
     st.warning("This build validates period coverage and prevents invented historical values. Provider data should still be reconciled against official NSE/company filings before public investment use.")
+
+
+with tabs[16]:
+    render_ratio_audit_panel(fin, info, live.get("price", np.nan), dividends, sector, ratios)
+
+with tabs[17]:
+    render_market_industry_panel(
+        universe=universe,
+        get_history=get_history,
+        get_live_quote=get_live_quote,
+        get_info=get_info,
+        get_financials=get_financials,
+        calc_ratios=calc_ratios,
+        selected_symbol=sym,
+        selected_ratios=ratios,
+        selected_sector=sector,
+    )
